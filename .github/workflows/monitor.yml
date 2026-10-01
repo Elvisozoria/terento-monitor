@@ -1,0 +1,61 @@
+# Monitor externo (spec §16.4). COPIA de referencia (fuera de .github/workflows a propósito: aquí no debe correr): el que corre vive en el repo PÚBLICO Elvisozoria/terento-monitor
+# (.github/workflows/monitor.yml), porque los `schedule` de GitHub solo corren desde la rama por defecto (aquí main,
+# que no se toca) y porque en un repo privado 4.320 corridas al mes se comen los minutos gratis de Actions (y con ellos
+# los deploys). En un repo público los minutos son gratis. Decisión en docs/ARQUITECTURA.md; operación en
+# docs/OPERACION.md («Monitor externo»). Si se cambia, cambiarlo en los dos.
+#
+# Cada 10 min consulta /healthz completo y FALLA si no responde 200: GitHub avisa por correo y en la app (notificaciones
+# de Actions: «failed workflows»). La corrida que cae entre las 12:00 y las 12:09 UTC (8:00 en R.D.) deja además el
+# heartbeat «todo bien» en el issue «Monitor de terento»: si un día no llega, el monitor mismo está caído. Los días 1 y
+# 15 hace un commit vacío: GitHub apaga los `schedule` de un repo público tras 60 días sin actividad.
+name: monitor
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions:
+  issues: write
+  contents: write
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+jobs:
+  healthz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      URL: https://oficina.terentounaweb.com/healthz
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: /healthz
+        run: |
+          set -u
+          ok=0
+          for i in 1 2 3; do # un fallo de red suelto no despierta a nadie
+            code=$(curl -s -o body.json -w '%{http_code}' --max-time 15 "$URL" || true)
+            [ "$code" = 200 ] && { ok=1; break; }
+            sleep 20
+          done
+          cat body.json 2>/dev/null; echo
+          [ "$ok" = 1 ] || { echo "::error::$URL respondió $code: $(cat body.json 2>/dev/null)"; exit 1; }
+      - name: heartbeat diario
+        if: success()
+        run: |
+          [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { [ "$(date -u +%H)" = 12 ] && [ "$(date -u +%M)" -lt 10 ]; } || exit 0
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search 'in:title "Monitor de terento"' --json number -q '.[0].number')
+          if [ -z "$n" ]; then
+            n=$(gh issue create -R "$GITHUB_REPOSITORY" --title "Monitor de terento" \
+              --body "Heartbeat diario del monitor externo. Si un día no llega, el monitor está caído." | grep -o '[0-9]*$')
+          fi
+          gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body "@Elvisozoria todo bien: $(cat body.json)"
+      - name: ¿toca mantener vivo el schedule?
+        id: alive
+        if: success() && github.event_name == 'schedule'
+        run: case "$(date -u +%d%H%M)" in 01120?|15120?) echo go=1 >> "$GITHUB_OUTPUT" ;; esac
+      - uses: actions/checkout@v4
+        if: steps.alive.outputs.go == '1'
+      - name: mantener vivo el schedule
+        if: steps.alive.outputs.go == '1'
+        run: |
+          git -c user.name=monitor -c user.email=monitor@users.noreply.github.com commit --allow-empty -qm "chore: keep schedule alive"
+          git push -q
